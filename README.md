@@ -1,4 +1,4 @@
-# DeepPhotoStyle_pytorch[(中文说明)](README_ZH.md)
+# DeepPhotoStyle_pytorch[()](README_ZH.md)
 Recreating paper ["Deep Photo Style Transfer"](https://arxiv.org/abs/1703.07511) with pytorch.
 This project supply semantic segmentation code.
 ## Here are some experiment results
