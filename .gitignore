@@ -1,0 +1,13 @@
+__pycache__/
+.ipynb_checkpoints
+experiments/
+metrics/__pycache__/
+models/__pycache__/
+toolbox/__pycache__/
+comparaison.py
+image_preprocessing.py
+closed_form_matting.py
+neural_style.py
+semsegpt/
+styletransfer/
+
