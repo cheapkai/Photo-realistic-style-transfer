@@ -1,161 +1,143 @@
-import copy
-from args import parse_args
-import datetime
-import time
-import logging
 import sys
 
-from models import get_model_and_losses
-from toolbox import get_experiment_parameters, configure_logger, get_optimizer, get_experiment, save_all, save_images, generate_plots, emptyLogger
-from metrics import get_listener
-
-from toolbox.image_preprocessing import plt_images
-from torch.nn.utils import clip_grad_norm
-
-def create_experience(query = None, parameters = None):
-    if parameters is None:
-        if query is None:
-            query = sys.argv[1:]
-        else:
-            query = query.split(" ")[1:]
-        args = parse_args(prog=query)
-    
-        parameters = get_experiment_parameters(args)
-
-    parameters.disp()
-
-    if not(parameters.ghost):
-        configure_logger(parameters.res_dir+"experiment.log")
-        log = logging.getLogger("main")
-    else:
-        log = emptyLogger()
-
-    experiment = get_experiment(parameters)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
 
-    listener = get_listener(parameters.no_metrics)
-    log.info("experiment and listener objects created")
+import torchvision.transforms as transforms
+import torchvision.models as models
 
-    model, losses =  get_model_and_losses(experiment, parameters, experiment.content_image)
-    log.info("model and losses objects created")
+from PIL import Image
 
-    optimizer, scheduler = get_optimizer(experiment, parameters)
-    log.info("optimizer and scheduler objects created")
+import matplotlib.pyplot as plt
 
-    log.info('Experiment ' + parameters.save_name+ ' started on {:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now()))
+import argparse
 
-    return {"parameters":parameters, "log":log, "experiment":experiment, "listener":listener, "model":model, "losses":losses, "optimizer":optimizer, "scheduler":scheduler}
+# ------custom module----
+import config
+import utils
+
+sys.path.append('seg')
+from seg.segmentation import *
+from model import *
+from merge_index import *
 
 
-def run_experience(experiment, model, parameters, losses, optimizer, scheduler, listener, log):
+def gen_mask(image_path):
+    """
+    Generate semantic mask
+    """
+    seg_result = segmentation(image_path).squeeze(0)
+    channel, height_, width_ = seg_result.size()
 
-    best_loss = 1e10
-    best_input = None
-
-    while experiment.local_epoch < parameters.num_epochs :
-
-        def closure():
-            nonlocal experiment
-            nonlocal best_input
-            nonlocal best_loss
-
-            # meta 
-            start_time = time.time()
-            meters = listener.reset_meters("train")
-
-            # init
-            experiment.input_image.data.clamp_(0, 1)
-            optimizer.zero_grad()
-            model(experiment.input_image)
-
-            style_loss = losses.compute_style_loss()
-            meters["style_loss"].update(style_loss.item())
-
-            content_loss = losses.compute_content_loss()
-            meters["content_loss"].update(content_loss.item())
-
-            tv_loss = losses.compute_tv_loss()
-            meters["tv_loss"].update(tv_loss.item())
-
-            reg_loss = losses.compute_reg_loss(experiment.input_image)
-            meters["reg_loss"].update(reg_loss.item())
-
-            loss = style_loss + content_loss + tv_loss + reg_loss
-
-            # Store the best result for outputing
-            if loss < best_loss:
-                best_loss = loss
-                best_input = experiment.input_image.data.clone()
-
-            experiment.input_image.retain_grad()
-            loss.backward()
-
-            meters["total_loss"].update(loss.item())
-
-            if parameters.verbose:
-                    print(
-                    "\repoch {}:".format(experiment.epoch),
-                    "S: {:.5f} C: {:.5f} R: {:.5f} TV: {:.5f}".format(
-                        style_loss.item(), content_loss.item(), 0 if reg_loss == 0 else reg_loss.item(), tv_loss
-                        ),
-                    end = "")
-
-            # Gradient cliping deal with gradient exploding
-            clip_grad_norm(model.parameters(), 15.0)
-
-            if parameters.scheduler == "plateau":
-                scheduler.step(style_loss.item()+content_loss.item()+reg_loss.item() if parameters.reg else 0)
+    for classes in merge_classes:
+        for index, each_class in enumerate(classes):
+            if index == 0:
+                zeros_index = each_class
+                base_map = seg_result[each_class, :, :].clone()
             else:
-                scheduler.step()
-            meters["lr"].update(optimizer.state_dict()['param_groups'][0]['lr'])
-            experiment.local_epoch += 1
-            experiment.epoch += 1
+                base_map = base_map | seg_result[each_class, :, :]
+        seg_result[zeros_index, :, :] = base_map
 
-            meters["epoch_time"].update(time.time()-start_time)        
-            listener.log_meters("train",experiment.epoch)
-            
-            return loss
-        
-        optimizer.step(closure)
+    return seg_result, height_, width_
 
-    experiment.input_image.data = best_input
-    experiment.input_image.data.clamp_(0, 1)
-
-def main():
-
-    experience = create_experience()
-
-    parameters = experience["parameters"]
-    experiment = experience["experiment"]
-    listener = experience["listener"]
-    log = experience["log"]
-    optimizer = experience["optimizer"]
-    losses = experience["losses"]
-    model = experience["model"] 
-    scheduler = experience["scheduler"]
-
-    run_experience(experiment, model, parameters, losses, optimizer, scheduler, listener, log)
-
-    experiment.input_image.data.clamp_(0, 1)
-
-    log.info("Done style transfering over "+str(experiment.epoch)+" epochs!")
+if __name__ == '__main__':
     
+    #----------init------------
+    ap = argparse.ArgumentParser()
 
-    if parameters.save_model:
-        save_all(experiment,model,parameters,listener)
-    if not(parameters.ghost):
-        save_images(parameters.res_dir+"output.png",experiment.style_image,experiment.input_image,experiment.content_image)
-    plt_images(experiment.style_image,experiment.input_image,experiment.content_image)
+    ap.add_argument("-s", "--style_image", required=True, 
+        help="path of the style image")
 
-    if not(parameters.no_metrics):
-        generate_plots(parameters, listener)
+    ap.add_argument("-c", "--content_image", required=True,
+        help="path of the content image")
 
-    print("All done")
+    args = vars(ap.parse_args())
+
+    style_image_path = args["style_image"]
+    content_image_path = args["content_image"]
+
+    #-------------------------
+    print('Computing Laplacian matrix of content image')
+    L = utils.compute_lap(content_image_path)
+    print()
+    #-------------------------
+    print('Merge the similar semantic mask')
+    style_mask_origin, height_, width_ = gen_mask(style_image_path)
+    content_mask_origin, height2, width2 = gen_mask(content_image_path)
+
+    merged_style_mask = np.zeros((117, height_, width_), dtype='int')
+    merged_content_mask = np.zeros((117, height2, width2), dtype='int')
+    print()
+    #--------------------------
+    count = 0
+    for i in range(150):
+        temp = style_mask_origin[i, :, :].numpy()
+        if i not in del_classed and np.sum(temp)>50:
+            # print(count, np.sum(temp))
+            merged_style_mask[count, :, :] = temp
+            merged_content_mask[count, :, :] = content_mask_origin[i, :, :].numpy()
+            count += 1
+        else:
+            pass
+    print('Total semantic classes in style image: {}'.format(count))
+    style_mask_tensor = torch.from_numpy(merged_style_mask[:count, :, :]).float().to(config.device0)
+    content_mask_tensor = torch.from_numpy(merged_content_mask[:count, :, :]).float().to(config.device0)
+    #--------------------------
+    print('Save each mask as an image for debugging')
+    for i in range(count):
+        utils.save_pic( torch.stack([style_mask_tensor[i, :, :], style_mask_tensor[i, :, :], style_mask_tensor[i, :, :]], dim=0), 
+                                    'style_mask_' + str(i) )
+        utils.save_pic( torch.stack([content_mask_tensor[i, :, :], content_mask_tensor[i, :, :], content_mask_tensor[i, :, :]], dim=0), 
+                                    'content_mask_' + str(i) )
+    
+    # Using GPU or CPU
+    device = torch.device(config.device0)
+
+
+    style_img = utils.load_image(style_image_path, None)
+    content_img = utils.load_image(content_image_path, None)
+    width_s, height_s = style_img.size
+    width_c, height_c = content_img.size
+    
+    # print(height_s, width_s)
+    # print(height_c, width_c)
+    
+    style_img = utils.image_to_tensor(style_img).unsqueeze(0)
+    content_img = utils.image_to_tensor(content_img).unsqueeze(0)
+
+    style_img = style_img.to(device, torch.float)
+    content_img = content_img.to(device, torch.float)
+    
+    # print('content_img size: ', content_img.size())
+    # utils.show_pic(style_img, 'style image')
+    # utils.show_pic(content_img, 'content image')
+
+    # -------------------------
+    # Eval() means the parameters of cnn are frozen.
+    cnn = models.vgg19(pretrained=True).features.to(config.device0).eval()
+
+    cnn_normalization_mean = torch.tensor([0.485, 0.456, 0.406]).to(config.device0)
+    cnn_normalization_std = torch.tensor([0.229, 0.224, 0.225]).to(config.device0)
+    
+    # Two different initialization ways
+    input_img = torch.randn(1, 3, height_c, width_c).to(config.device0)
+    # input_img = content_img.clone()
+    # print('input_img size: ', input_img.size())
+    output = run_style_transfer(cnn, cnn_normalization_mean, cnn_normalization_std,
+                                content_img, style_img, input_img,
+                                style_mask_tensor, content_mask_tensor, L)
+    print('Style transfer completed')
+    utils.save_pic(output, 'deep_style_tranfer')
+    print()
+
+    #--------------------------
+    print('Postprocessing......')
+    utils.post_process(output, content_image_path)
+    print('Done!')
 
 
 
-
-
-if __name__=="__main__":
-    main()
 
